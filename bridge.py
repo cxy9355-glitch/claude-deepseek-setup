@@ -21,6 +21,7 @@ import logging
 import os
 import socket
 import sqlite3
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
