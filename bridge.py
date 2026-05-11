@@ -465,6 +465,7 @@ class ClaudeRunner:
             cmd += ["--resume", session_id, "--fork-session"]
 
         env = self._make_env()
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -481,6 +482,9 @@ class ClaudeRunner:
             except asyncio.TimeoutError:
                 proc.kill()
                 return 124, f"⏱ 执行超时（{self._cfg.task_timeout} 秒），已终止。"
+            except asyncio.CancelledError:
+                proc.kill()
+                raise   # 继续向上传播，让 _run_talk 处理
             return proc.returncode or 0, stdout.decode("utf-8", errors="replace").strip()
         except FileNotFoundError:
             return 1, "❌ 找不到 claude 命令，请确认 claude CLI 已安装并在 PATH 中。"
@@ -527,6 +531,8 @@ def parse_command(text: str) -> Command:
     lower = t.lower()
     if lower == "claude":
         return Command(kind="HELP")
+    if lower == "claude exit":
+        return Command(kind="EXIT")
     if lower == "claude list":
         return Command(kind="LIST")
     if lower == "claude new":
@@ -557,8 +563,8 @@ class MessageHandler:
         self._store = store
         self._index = index
         self._runner = runner
-        # 每个 chat_id 当前是否有任务在跑（内存，重启后清空）
-        self._running: set[str] = set()
+        # 每个 chat_id 当前运行的 asyncio.Task（内存，重启后清空）
+        self._running: dict[str, asyncio.Task[None]] = {}
 
     async def handle(self, chat_id: str, message_id: str, text: str) -> None:
         # 1. 白名单
@@ -581,8 +587,17 @@ class MessageHandler:
                 "  claude list      — 查看最近会话\n"
                 "  claude switch N  — 切换到第 N 个会话\n"
                 "  claude new       — 开启新会话\n"
+                "  claude exit      — 中断当前执行\n"
                 "  其他任意内容     — 发送给 Claude 执行"
             ))
+            return
+        if cmd.kind == "EXIT":
+            task = self._running.get(chat_id)
+            if task and not task.done():
+                task.cancel()
+                await self._feishu.send_text(chat_id, "🛑 已中断当前执行")
+            else:
+                await self._feishu.send_text(chat_id, "当前没有正在执行的任务")
             return
         if cmd.kind == "LIST":
             await self._handle_list(chat_id)
@@ -596,28 +611,31 @@ class MessageHandler:
             return
 
         # 5. TALK：检查并发
-        if chat_id in self._running:
-            await self._feishu.send_text(chat_id, "⏳ 上一个任务仍在执行中，请稍候")
+        if chat_id in self._running and not self._running[chat_id].done():
+            await self._feishu.send_text(chat_id, "⏳ 上一个任务仍在执行中，发送 claude exit 可中断")
             return
 
-        # 6. 执行
-        self._running.add(chat_id)
+        # 6. 启动执行 Task
+        task = asyncio.create_task(self._run_talk(chat_id, cmd.text))
+        self._running[chat_id] = task
+
+    async def _run_talk(self, chat_id: str, prompt: str) -> None:
         try:
             await self._feishu.send_text(chat_id, "⏳ 处理中...")
             session_id = self._store.get_session(chat_id)
             output, new_sid = await self._runner.run(
-                cmd.text, session_id, self._cfg.workspace
+                prompt, session_id, self._cfg.workspace
             )
-            # 保存新 session
             if new_sid:
                 self._store.set_session(chat_id, new_sid)
-            # 回复结果
             await self._feishu.send_text(chat_id, output or "（无输出）")
+        except asyncio.CancelledError:
+            await self._feishu.send_text(chat_id, "🛑 已中断")
         except Exception as exc:
             log.exception("执行出错")
             await self._feishu.send_text(chat_id, f"❌ 内部错误：{exc}")
         finally:
-            self._running.discard(chat_id)
+            self._running.pop(chat_id, None)
 
     async def _handle_list(self, chat_id: str) -> None:
         sessions = self._index.list_sessions()
