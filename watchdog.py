@@ -12,15 +12,15 @@ LOCK_PORT = 57384   # 与 bridge.py 保持一致
 
 
 def _bridge_running() -> bool:
-    """尝试连接锁端口：能连上说明 bridge 在运行。"""
+    """尝试绑定锁端口：绑定失败说明 bridge 正在运行并持有该端口。"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1)
-        s.connect(("127.0.0.1", LOCK_PORT))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        s.bind(("127.0.0.1", LOCK_PORT))
         s.close()
-        return True
+        return False   # 绑定成功 → 端口空闲 → bridge 未运行
     except OSError:
-        return False
+        return True    # 绑定失败 → 端口被占 → bridge 运行中
 
 
 def main() -> None:

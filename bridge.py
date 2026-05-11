@@ -19,6 +19,7 @@ import ctypes
 import json
 import logging
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -31,23 +32,37 @@ import httpx
 import lark_oapi as lark
 
 # ─────────────────────────────────────────────────────────────
-# 日志
-# ─────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("bridge")
-
-# ─────────────────────────────────────────────────────────────
-# Config
+# 基础常量
 # ─────────────────────────────────────────────────────────────
 
 HERE = Path(__file__).resolve().parent
-
 SESSION_NOT_FOUND = "No conversation found with session ID"
+
+# ─────────────────────────────────────────────────────────────
+# 日志（必须在 HERE 之后定义和调用）
+# ─────────────────────────────────────────────────────────────
+
+
+def _setup_logging() -> None:
+    """配置日志：pythonw.exe 无 stderr，输出到文件；python.exe 同时输出到 stderr。"""
+    log_file = HERE / "data" / "bridge.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ]
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler(sys.stderr))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+    )
+
+
+log = logging.getLogger("bridge")   # 先拿 logger，main() 里再配置 handler
 
 
 def _load_env(path: Path) -> None:
@@ -353,6 +368,34 @@ class ClaudeRunner:
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
 
+    @staticmethod
+    def _resolve_claude() -> str | None:
+        """找到 claude CLI 的完整路径。
+        依次查找：CLAUDE_BIN 环境变量 → shutil.which → npm 默认位置。
+        """
+        import shutil
+
+        # 1. 环境变量指定
+        env_bin = os.environ.get("CLAUDE_BIN", "").strip()
+        if env_bin and Path(env_bin).exists():
+            return env_bin
+
+        # 2. PATH 里查找（普通终端启动时有效）
+        found = shutil.which("claude")
+        if found:
+            return found
+
+        # 3. npm 全局安装的默认位置（pythonw 启动时 PATH 可能不含 npm）
+        npm_dirs = [
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude",
+        ]
+        for p in npm_dirs:
+            if p.exists():
+                return str(p)
+
+        return None
+
     def _make_env(self) -> dict[str, str]:
         env = dict(os.environ)
         key = self._cfg.deepseek_api_key
@@ -406,7 +449,10 @@ class ClaudeRunner:
         workspace: Path,
     ) -> tuple[int, str]:
         """执行 claude 子进程，返回 (returncode, stdout)。"""
-        claude_bin = "claude"
+        claude_bin = self._resolve_claude()
+        if claude_bin is None:
+            return 1, "❌ 找不到 claude 命令，请确认 claude CLI 已安装并在 PATH 中。"
+
         cmd = [
             claude_bin,
             "-p", prompt,
@@ -594,17 +640,17 @@ class MessageHandler:
 # ─────────────────────────────────────────────────────────────
 
 def _acquire_lock() -> Any | None:
-    """绑定本地固定端口作为单实例锁。端口被占用说明已有实例在运行。"""
-    import socket
-    LOCK_PORT = 57384   # 仅用于单实例检测，不对外服务
+    """绑定并监听本地固定端口作为单实例锁。进程退出时 OS 自动释放。"""
+    LOCK_PORT = 57384
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     try:
         s.bind(("127.0.0.1", LOCK_PORT))
-        return s   # 保持 socket 打开 = 持有锁
+        s.listen(1)      # 必须 listen，否则 watchdog 的 connect 检查会失败
+        return s
     except OSError:
         s.close()
-        return None   # 端口被占 = 已有实例
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -637,13 +683,14 @@ def _extract_message(event: Any) -> tuple[str, str, str] | None:
 # ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    cfg = Config.from_env()
-
-    # 单实例锁
+    # 单实例锁必须最先检查，在任何初始化之前
     lock_handle = _acquire_lock()
     if lock_handle is None:
-        log.info("另一个 bridge 实例正在运行，退出。")
-        sys.exit(0)
+        os._exit(0)   # 快速退出，无需日志
+
+    # 锁获取成功，才配置日志和初始化
+    _setup_logging()
+    cfg = Config.from_env()
 
     log.info("feishu-claude bridge 启动")
     log.info("工作目录: %s", cfg.workspace)
