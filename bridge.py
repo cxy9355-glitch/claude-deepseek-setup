@@ -471,6 +471,7 @@ class ClaudeRunner:
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(workspace),
                 env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             try:
                 stdout, _ = await asyncio.wait_for(
@@ -523,6 +524,8 @@ class Command:
 def parse_command(text: str) -> Command:
     t = text.strip()
     lower = t.lower()
+    if lower == "claude":
+        return Command(kind="HELP")
     if lower == "claude list":
         return Command(kind="LIST")
     if lower == "claude new":
@@ -571,6 +574,15 @@ class MessageHandler:
         cmd = parse_command(text)
 
         # 4. 非 TALK 指令直接处理
+        if cmd.kind == "HELP":
+            await self._feishu.send_text(chat_id, (
+                "可用指令：\n"
+                "  claude list      — 查看最近会话\n"
+                "  claude switch N  — 切换到第 N 个会话\n"
+                "  claude new       — 开启新会话\n"
+                "  其他任意内容     — 发送给 Claude 执行"
+            ))
+            return
         if cmd.kind == "LIST":
             await self._handle_list(chat_id)
             return
